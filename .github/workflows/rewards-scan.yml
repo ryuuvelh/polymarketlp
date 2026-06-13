@@ -1,6 +1,12 @@
 name: Polymarket Rewards Scan
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   schedule:
     # Every hour at minute 0 (UTC)
     - cron: "0 * * * *"
@@ -66,7 +72,11 @@ jobs:
           retention-days: 7
 
       - name: Notify Discord
-        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python -m polymarket_rewards.notify scan-results.md
+        run: |
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            python -m polymarket_rewards.notify scan-results.md
+          else
+            echo "DISCORD_WEBHOOK_URL not configured, skipping Discord notify"
+          fi
