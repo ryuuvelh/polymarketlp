@@ -7,11 +7,13 @@ from datetime import datetime, timezone
 
 from rich.console import Console
 
+from .news.service import refresh_news
 from .order_manager import OrderManager
+from .position_regime import is_flat_regime, quote_mode_for_regime
 from .risk import RiskDecision, RiskConfig, RiskEngine
 from .scanner import RewardsScanner, ScanFilters
 from .scorer import TierConfig, build_quote_plan, midpoint_from_tokens
-from .trader import RewardsTrader, TraderConfig
+from .trader import RewardsTrader
 from .ws_monitor import MonitorEvent, WsMonitor
 
 
@@ -61,11 +63,12 @@ class RewardsEngine:
             exclude_near_expiry=True,
             max_capital_usd=self.risk_config.deployable_usd,
         )
-        results = self.scanner.scan(filters)
+        results = self.scanner.scan(filters, with_news=True)
         if not results:
             raise RuntimeError("No markets matched auto-pick risk filters")
 
         pick = max(1, self.engine_config.auto_pick_top)
+        results.sort(key=lambda item: item.combined_risk_adjusted_score or item.risk_adjusted_score, reverse=True)
         return results[pick - 1].market.market_id
 
     def _on_ws_event(self, event: MonitorEvent, payload: dict) -> None:
@@ -77,13 +80,34 @@ class RewardsEngine:
         score = self.scanner.get_market_score(market_id, tier_config=self.tier_config)
         if score is None:
             raise RuntimeError(f"Market {market_id} not found among active reward markets")
-        return score
+        _, enriched = refresh_news([score])
+        return enriched[0]
+
+    def _best_bids(self, score) -> dict[str, float]:
+        best: dict[str, float] = {}
+        for token in score.market.tokens[:2]:
+            try:
+                book = self.trader.public_client.fetch_order_book(token.token_id)
+                bids = book.get("bids") or []
+                if bids:
+                    best[token.token_id] = float(bids[0].get("price", 0))
+            except Exception:
+                continue
+        return best
 
     def _planned_notional(self, plans) -> float:
         return sum(plan.price * plan.size for plan in plans)
 
     def _tick(self, market_id: str) -> None:
         score = self._refresh_score(market_id)
+
+        if is_flat_regime(score.news_regime):
+            self.console.print(
+                f"[yellow]News regime {score.news_regime} (risk={score.news_risk_score:.0f}): flat[/yellow]"
+            )
+            self.order_manager.cancel_all()
+            return
+
         midpoint = midpoint_from_tokens(score.market.tokens)
         momentum = None
         if self._previous_midpoint is not None:
@@ -97,6 +121,7 @@ class RewardsEngine:
         yes_balance = balances.get(token_ids[0], 0.0)
         no_balance = balances.get(token_ids[1], 0.0) if len(token_ids) > 1 else 0.0
 
+        quote_mode = quote_mode_for_regime(score.news_regime)
         plans = build_quote_plan(
             score.market,
             tier_config=self.tier_config,
@@ -104,6 +129,9 @@ class RewardsEngine:
             yes_balance=yes_balance,
             no_balance=no_balance,
             imbalance_threshold_pct=self.risk_config.inventory_imbalance_pct,
+            quote_mode=quote_mode,
+            news_sentiment_lean=score.news_sentiment_lean,
+            best_bids=self._best_bids(score),
         )
         notional = self._planned_notional(plans)
         decision = self.risk_engine.evaluate_tick(score, planned_notional_usd=notional)
@@ -116,12 +144,16 @@ class RewardsEngine:
             self.console.print("[yellow]Risk guard blocked new quotes (cooldown or capital)[/yellow]")
             return
 
-        self.order_manager.sync_orders()
-        results = self.order_manager.replace_quotes(plans, market_question=score.market.question)
+        results = self.order_manager.replace_quotes(
+            plans,
+            market_question=score.market.question,
+            cancel_first=True,
+        )
+        headline = score.news_headlines[0][:60] if score.news_headlines else "-"
         self.console.print(
             f"[green]{datetime.now(timezone.utc).isoformat()}[/green] "
-            f"mid={midpoint:.3f} risk={score.risk_score:.0f} "
-            f"orders={len(results)} est_reward=${score.estimated_daily_reward:.2f}/day"
+            f"mid={midpoint:.3f} news={score.news_risk_score:.0f} regime={score.news_regime} "
+            f"orders={len(results)} headline={headline}"
         )
 
     def run(self) -> int:

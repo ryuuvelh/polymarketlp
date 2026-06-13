@@ -6,6 +6,7 @@ from typing import Iterable
 
 from .client import RewardsMarket, RewardsToken
 from .market_time import hours_until_expiry
+from .position_regime import QuoteMode, quote_mode_for_regime
 
 # Polymarket uses a scaling factor of 3 for single-sided quoting in the [0.10, 0.90] band.
 SINGLE_SIDED_PENALTY = 3.0
@@ -76,6 +77,11 @@ class MarketScore:
     risk_flags: tuple[str, ...]
     risk_adjusted_score: float
     hours_to_expiry: float | None
+    news_risk_score: float = 0.0
+    news_regime: str = "full_lp"
+    news_sentiment_lean: float = 0.0
+    news_headlines: tuple[str, ...] = ()
+    combined_risk_adjusted_score: float = 0.0
 
 
 def order_score(max_spread_cents: float, spread_cents: float) -> float:
@@ -239,10 +245,16 @@ def build_quote_plan(
     yes_balance: float = 0.0,
     no_balance: float = 0.0,
     imbalance_threshold_pct: float = 0.30,
+    quote_mode: QuoteMode | None = None,
+    news_sentiment_lean: float = 0.0,
+    best_bids: dict[str, float] | None = None,
 ) -> list[QuotePlan]:
     """Build tiered asymmetric quote plans inside the reward band."""
     if len(market.tokens) < 2:
         return []
+
+    if quote_mode is None:
+        quote_mode = quote_mode_for_regime("full_lp")
 
     midpoint = midpoint_from_tokens(market.tokens)
     two_sided = requires_two_sided_quoting(midpoint)
@@ -251,9 +263,17 @@ def build_quote_plan(
     tick = 0.01 if midpoint >= 0.1 else 0.001
 
     yes_token, no_token = market.tokens[0], market.tokens[1]
-    tiers = default_tier_configs(tier_config) if tier_config else (
-        QuoteTierConfig("active", 0.0, 1.0),
-    )
+    all_tiers = default_tier_configs(tier_config) if tier_config else (QuoteTierConfig("active", 0.0, 1.0),)
+    tiers: list[QuoteTierConfig] = []
+    for tier in all_tiers:
+        if tier.label == "active" and not quote_mode.use_active_tier:
+            continue
+        if tier.label == "buffer" and not quote_mode.use_buffer_tier:
+            continue
+        tiers.append(tier)
+    if not tiers:
+        return []
+
     max_skew = tier_config.max_skew_cents if tier_config else DEFAULT_MAX_SKEW_CENTS
     mom_yes_skew, mom_no_skew = _momentum_skew_cents(momentum, max_skew)
     inv_yes_skew, inv_no_skew = _inventory_skew_cents(
@@ -262,22 +282,47 @@ def build_quote_plan(
         imbalance_threshold_pct=imbalance_threshold_pct,
         max_skew_cents=max_skew,
     )
+    if news_sentiment_lean > 0.2:
+        no_widen_extra = quote_mode.extra_vulnerable_skew_cents
+        mom_no_skew += no_widen_extra
+    elif news_sentiment_lean < -0.2:
+        mom_yes_skew += quote_mode.extra_vulnerable_skew_cents
 
     plans: list[QuotePlan] = []
     include_no = two_sided or tier_config is not None
+    join_ticks = quote_mode.join_not_lead_ticks * tick
+    best_bids = best_bids or {}
+
     for tier in tiers:
         spread_offset = tier.spread_offset_cents / 100.0
         yes_widen = (mom_yes_skew + inv_yes_skew) / 100.0
         no_widen = (mom_no_skew + inv_no_skew) / 100.0
 
-        yes_price = round(max(tick, midpoint - max_spread + tick - spread_offset - yes_widen), 3)
+        yes_price = round(max(tick, midpoint - max_spread + tick - spread_offset - yes_widen - join_ticks), 3)
         ask_price = round(min(1.0 - tick, midpoint + max_spread - tick + spread_offset), 3)
-        no_price = round(max(tick, 1.0 - ask_price - no_widen), 3)
+        no_price = round(max(tick, 1.0 - ask_price - no_widen - join_ticks), 3)
+
+        yes_best = best_bids.get(yes_token.token_id)
+        no_best = best_bids.get(no_token.token_id)
+        if yes_best is not None and quote_mode.join_not_lead_ticks > 0:
+            yes_price = min(yes_price, round(yes_best - join_ticks, 3))
+        if no_best is not None and quote_mode.join_not_lead_ticks > 0:
+            no_price = min(no_price, round(no_best - join_ticks, 3))
 
         if tier_config is not None:
             tier_usd = _tier_size_usd(tier, tier_config) / (2 if include_no else 1)
-            yes_size = _size_from_usd(tier_usd, yes_price, min_size)
-            no_size = _size_from_usd(tier_usd, no_price, min_size)
+            tier_usd *= quote_mode.buffer_size_multiplier
+            if news_sentiment_lean > 0.2:
+                yes_usd = tier_usd * (1.0 - quote_mode.sentiment_size_skew)
+                no_usd = tier_usd * (1.0 + quote_mode.sentiment_size_skew)
+            elif news_sentiment_lean < -0.2:
+                yes_usd = tier_usd * (1.0 + quote_mode.sentiment_size_skew)
+                no_usd = tier_usd * (1.0 - quote_mode.sentiment_size_skew)
+            else:
+                yes_usd = tier_usd
+                no_usd = tier_usd
+            yes_size = _size_from_usd(yes_usd, yes_price, min_size)
+            no_size = _size_from_usd(no_usd, no_price, min_size)
         else:
             yes_size = min_size
             no_size = min_size
@@ -347,6 +392,7 @@ def score_market(
         risk_flags=risk_flags,
         risk_adjusted_score=risk_adjusted,
         hours_to_expiry=hours_left,
+        combined_risk_adjusted_score=risk_adjusted,
     )
 
 

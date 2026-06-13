@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from polymarket_rewards.engine import EngineConfig, RewardsEngine
+from polymarket_rewards.news.service import get_cached_events, refresh_news
 from polymarket_rewards.risk import RiskConfig
 from polymarket_rewards.scanner import RewardsScanner, ScanFilters
 from polymarket_rewards.scorer import TierConfig
@@ -53,10 +54,15 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--query", type=str, default=None, help="Text search on market question")
     scan.add_argument("--tag", type=str, default=None, help="Filter by tag slug")
     scan.add_argument(
+        "--with-news",
+        action="store_true",
+        help="Enrich scan with multi-feed news risk scores and regimes",
+    )
+    scan.add_argument(
         "--sort",
-        choices=["efficiency", "reward", "pool", "risk_adjusted"],
+        choices=["efficiency", "reward", "pool", "risk_adjusted", "combined"],
         default="risk_adjusted",
-        help="Sort by capital efficiency, estimated reward, raw pool, or risk-adjusted score",
+        help="Sort by capital efficiency, estimated reward, raw pool, risk-adjusted, or news-combined score",
     )
     scan.add_argument(
         "--format",
@@ -65,6 +71,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format (markdown/json useful for GitHub Actions)",
     )
     scan.add_argument("--output", type=str, default=None, help="Write results to a file")
+
+    news_scan = subparsers.add_parser("news-scan", help="Rank news events linked to reward markets")
+    news_scan.add_argument("--top", type=int, default=20, help="Number of events to show")
+    news_scan.add_argument("--min-rate", type=float, default=5.0, help="Minimum $/day reward pool for market scan")
+    news_scan.add_argument("--min-volume", type=float, default=1000.0, help="Minimum 24h volume in USDC")
+    news_scan.add_argument(
+        "--format",
+        choices=["table", "json", "markdown"],
+        default="table",
+        help="Output format",
+    )
+    news_scan.add_argument("--output", type=str, default=None, help="Write results to a file")
 
     quote = subparsers.add_parser("quote", help="Place reward-qualifying quotes for one market")
     quote.add_argument("--market-id", required=True, help="Polymarket market_id from scan output")
@@ -99,32 +117,47 @@ def _format_expiry(hours: float | None) -> str:
     return f"{hours / 24:.1f}d"
 
 
-def render_scan_results(results, top: int, console: Console, sort: str) -> None:
-    table = Table(title=f"Top Polymarket Liquidity Reward Opportunities (sorted by {sort})")
+def render_scan_results(results, top: int, console: Console, sort: str, *, with_news: bool = False) -> None:
+    title = f"Top Polymarket Liquidity Reward Opportunities (sorted by {sort})"
+    table = Table(title=title)
     table.add_column("#", justify="right")
-    table.add_column("Market", max_width=40)
+    table.add_column("Market", max_width=36)
     table.add_column("$/day", justify="right")
     table.add_column("Comp", justify="right")
     table.add_column("Est $/day", justify="right")
     table.add_column("Capital", justify="right")
     table.add_column("Risk", justify="right")
+    if with_news:
+        table.add_column("News", justify="right")
+        table.add_column("Regime", max_width=12)
+        table.add_column("Headline", max_width=28)
     table.add_column("Expires", justify="right")
-    table.add_column("Notes", max_width=24)
+    table.add_column("Notes", max_width=20)
 
     for index, item in enumerate(results[:top], start=1):
         market = item.market
         flags = ",".join(item.risk_flags[:2]) if item.risk_flags else "-"
-        table.add_row(
+        row = [
             str(index),
-            market.question[:40],
+            market.question[:36],
             f"{market.rate_per_day:,.0f}",
             f"{market.market_competitiveness:.2f}",
             f"{item.estimated_daily_reward:.2f}",
             f"${item.capital_required_usd:,.0f}",
             f"{item.risk_score:.0f}",
+        ]
+        if with_news:
+            headline = item.news_headlines[0][:28] if item.news_headlines else "-"
+            row.extend([
+                f"{item.news_risk_score:.0f}",
+                item.news_regime,
+                headline,
+            ])
+        row.extend([
             _format_expiry(item.hours_to_expiry),
             flags,
-        )
+        ])
+        table.add_row(*row)
 
     console.print(table)
     console.print()
@@ -152,7 +185,7 @@ def render_scan_details(results, top: int, console: Console) -> None:
 
 def score_to_dict(item) -> dict:
     market = item.market
-    return {
+    payload = {
         "market_id": market.market_id,
         "question": market.question,
         "market_slug": market.market_slug,
@@ -167,49 +200,114 @@ def score_to_dict(item) -> dict:
         "risk_score": item.risk_score,
         "risk_flags": list(item.risk_flags),
         "risk_adjusted_score": item.risk_adjusted_score,
+        "combined_risk_adjusted_score": item.combined_risk_adjusted_score or item.risk_adjusted_score,
         "hours_to_expiry": item.hours_to_expiry,
         "notes": list(item.notes),
+        "news_risk_score": item.news_risk_score,
+        "news_regime": item.news_regime,
+        "news_sentiment_lean": item.news_sentiment_lean,
+        "news_headlines": list(item.news_headlines),
     }
+    return payload
 
 
-def render_scan_markdown(results, top: int, sort: str) -> str:
+def _sort_key(item, sort: str, *, with_news: bool = False):
+    if sort == "reward":
+        return item.estimated_daily_reward
+    if sort == "pool":
+        return item.market.rate_per_day
+    if sort == "efficiency":
+        return item.opportunity_score
+    if sort == "combined" or (sort == "risk_adjusted" and with_news):
+        return item.combined_risk_adjusted_score or item.risk_adjusted_score
+    return item.risk_adjusted_score
+
+
+def render_scan_markdown(results, top: int, sort: str, *, events=None) -> str:
+    with_news = any(item.news_risk_score > 0 or item.news_headlines for item in results[:top])
     lines = [
         "# Polymarket Liquidity Reward Opportunities",
         "",
         f"Sorted by **{sort}** · showing top {min(top, len(results))} markets",
         "",
-        "| # | Market | $/day | Comp | Est $/day | Capital | Risk | Expires | Flags | market_id |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---|---|",
     ]
+    if with_news:
+        lines.extend([
+            "| # | Market | $/day | Comp | Est $/day | Capital | Risk | News | Regime | Headline | Expires | Flags | market_id |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---|---|---:|---|---|",
+        ])
+    else:
+        lines.extend([
+            "| # | Market | $/day | Comp | Est $/day | Capital | Risk | Expires | Flags | market_id |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---|---|",
+        ])
     for index, item in enumerate(results[:top], start=1):
         market = item.market
         question = market.question.replace("|", "/")[:50]
         flags = ",".join(item.risk_flags[:3]) if item.risk_flags else "-"
-        lines.append(
-            f"| {index} | {question} | {market.rate_per_day:,.0f} | "
-            f"{market.market_competitiveness:.2f} | {item.estimated_daily_reward:.2f} | "
-            f"${item.capital_required_usd:,.0f} | {item.risk_score:.0f} | "
-            f"{_format_expiry(item.hours_to_expiry)} | {flags} | {market.market_id} |"
-        )
+        if with_news:
+            headline = (item.news_headlines[0] if item.news_headlines else "-").replace("|", "/")[:40]
+            lines.append(
+                f"| {index} | {question} | {market.rate_per_day:,.0f} | "
+                f"{market.market_competitiveness:.2f} | {item.estimated_daily_reward:.2f} | "
+                f"${item.capital_required_usd:,.0f} | {item.risk_score:.0f} | "
+                f"{item.news_risk_score:.0f} | {item.news_regime} | {headline} | "
+                f"{_format_expiry(item.hours_to_expiry)} | {flags} | {market.market_id} |"
+            )
+        else:
+            lines.append(
+                f"| {index} | {question} | {market.rate_per_day:,.0f} | "
+                f"{market.market_competitiveness:.2f} | {item.estimated_daily_reward:.2f} | "
+                f"${item.capital_required_usd:,.0f} | {item.risk_score:.0f} | "
+                f"{_format_expiry(item.hours_to_expiry)} | {flags} | {market.market_id} |"
+            )
 
     lines.extend(["", "## Links", ""])
     for item in results[:top]:
         market = item.market
         lines.append(f"- [{market.question[:80]}]({market.polymarket_url}) (`{market.market_id}`)")
 
+    if events:
+        lines.extend(["", "## Ranked News Events", ""])
+        lines.append("| # | Event | Risk | Regime | Sources | Headlines | Markets |")
+        lines.append("|---:|---|---:|---|---:|---|---|")
+        for index, event in enumerate(events[:top], start=1):
+            label = event.label.replace("|", "/")[:40]
+            headlines = "; ".join(event.top_headlines[:2]).replace("|", "/")[:60]
+            markets = ", ".join(event.matched_market_ids[:3]) or "-"
+            lines.append(
+                f"| {index} | {label} | {event.news_risk_score:.0f} | {event.regime} | "
+                f"{event.source_count} | {headlines} | {markets} |"
+            )
+
     return "\n".join(lines) + "\n"
 
 
-def write_scan_output(results, args: argparse.Namespace) -> None:
+def write_scan_output(results, args: argparse.Namespace, *, events=None) -> None:
     if args.format == "json":
         payload = {
             "sort": args.sort,
             "count": len(results[: args.top]),
             "markets": [score_to_dict(item) for item in results[: args.top]],
         }
+        if events is not None:
+            payload["news_events"] = [
+                {
+                    "event_id": event.event_id,
+                    "label": event.label,
+                    "news_risk_score": event.news_risk_score,
+                    "regime": event.regime,
+                    "sentiment_lean": event.sentiment_lean,
+                    "source_count": event.source_count,
+                    "headline_count": event.headline_count,
+                    "matched_market_ids": list(event.matched_market_ids),
+                    "top_headlines": list(event.top_headlines),
+                }
+                for event in events[: args.top]
+            ]
         text = json.dumps(payload, indent=2) + "\n"
     elif args.format == "markdown":
-        text = render_scan_markdown(results, args.top, args.sort)
+        text = render_scan_markdown(results, args.top, args.sort, events=events)
     else:
         return
 
@@ -240,15 +338,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     if args.format == "table":
         console.print("Fetching reward markets from Polymarket CLOB API...")
-    results = scanner.scan(filters)
-    if args.sort == "reward":
-        results.sort(key=lambda item: item.estimated_daily_reward, reverse=True)
-    elif args.sort == "pool":
-        results.sort(key=lambda item: item.market.rate_per_day, reverse=True)
-    elif args.sort == "efficiency":
-        results.sort(key=lambda item: item.opportunity_score, reverse=True)
-    else:
-        results.sort(key=lambda item: item.risk_adjusted_score, reverse=True)
+    results = scanner.scan(filters, with_news=args.with_news)
+    events = get_cached_events() if args.with_news else None
+    results.sort(key=lambda item: _sort_key(item, args.sort, with_news=args.with_news), reverse=True)
 
     if not results:
         message = "No markets matched your filters. Try lowering --min-rate or --max-competitiveness."
@@ -259,11 +351,93 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return 1
 
     if args.format != "table":
-        write_scan_output(results, args)
+        write_scan_output(results, args, events=events)
         return 0
 
-    render_scan_results(results, args.top, console, args.sort)
+    render_scan_results(results, args.top, console, args.sort, with_news=args.with_news)
     render_scan_details(results, args.top, console)
+    return 0
+
+
+def render_news_events(events, top: int, console: Console) -> None:
+    table = Table(title="Ranked News Events")
+    table.add_column("#", justify="right")
+    table.add_column("Event", max_width=32)
+    table.add_column("Risk", justify="right")
+    table.add_column("Regime", max_width=14)
+    table.add_column("Sources", justify="right")
+    table.add_column("Headlines", max_width=40)
+    table.add_column("Markets", max_width=16)
+
+    for index, event in enumerate(events[:top], start=1):
+        headlines = "; ".join(event.top_headlines[:2])[:40]
+        markets = ", ".join(event.matched_market_ids[:2]) or "-"
+        table.add_row(
+            str(index),
+            event.label[:32],
+            f"{event.news_risk_score:.0f}",
+            event.regime,
+            str(event.source_count),
+            headlines,
+            markets,
+        )
+    console.print(table)
+
+
+def cmd_news_scan(args: argparse.Namespace) -> int:
+    console = Console() if args.format == "table" else None
+    scanner = RewardsScanner()
+    filters = ScanFilters(
+        min_rate_per_day=args.min_rate,
+        min_volume_24hr=args.min_volume,
+    )
+    if args.format == "table":
+        console.print("Scanning markets and fetching news feeds...")
+    results = scanner.scan(filters)
+    events, enriched = refresh_news(results)
+
+    if not events:
+        message = "No news events matched scanned markets (RSS-only mode may have fewer matches)."
+        if args.format == "table":
+            console.print(f"[yellow]{message}[/yellow]")
+        else:
+            print(message, file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        payload = {
+            "count": len(events[: args.top]),
+            "events": [
+                {
+                    "event_id": event.event_id,
+                    "label": event.label,
+                    "news_risk_score": event.news_risk_score,
+                    "regime": event.regime,
+                    "sentiment_lean": event.sentiment_lean,
+                    "source_count": event.source_count,
+                    "headline_count": event.headline_count,
+                    "matched_market_ids": list(event.matched_market_ids),
+                    "top_headlines": list(event.top_headlines),
+                }
+                for event in events[: args.top]
+            ],
+        }
+        text = json.dumps(payload, indent=2) + "\n"
+        if args.output:
+            Path(args.output).write_text(text, encoding="utf-8")
+        else:
+            sys.stdout.write(text)
+        return 0
+
+    if args.format == "markdown":
+        text = render_scan_markdown(enriched, args.top, "news_risk", events=events)
+        if args.output:
+            Path(args.output).write_text(text, encoding="utf-8")
+        else:
+            sys.stdout.write(text)
+        return 0
+
+    render_news_events(events, args.top, console)
     return 0
 
 
@@ -351,6 +525,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "scan":
         return cmd_scan(args)
+    if args.command == "news-scan":
+        return cmd_news_scan(args)
     if args.command == "quote":
         return cmd_quote(args)
     if args.command == "run":

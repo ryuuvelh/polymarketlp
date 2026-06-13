@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .client import ClobClient, RewardsMarket
+from .news.service import refresh_news
 from .scorer import MarketScore, TierConfig, rank_markets, score_market
 
 
@@ -29,7 +30,7 @@ class RewardsScanner:
             return None
         return score_market(market, tier_config=tier_config)
 
-    def scan(self, filters: ScanFilters | None = None) -> list[MarketScore]:
+    def scan(self, filters: ScanFilters | None = None, *, with_news: bool = False) -> list[MarketScore]:
         filters = filters or ScanFilters()
         tier_config = TierConfig.from_env() if filters.max_capital_usd is None else None
         if filters.max_capital_usd is not None and tier_config is None:
@@ -46,7 +47,10 @@ class RewardsScanner:
         markets = self.client.fetch_all_reward_markets(params=params or None)
         markets = self._apply_local_filters(markets, filters)
         ranked = rank_markets(markets, tier_config=tier_config)
-        return self._apply_score_filters(ranked, filters)
+        result = self._apply_score_filters(ranked, filters)
+        if with_news and result:
+            _, result = refresh_news(result)
+        return result
 
     @staticmethod
     def _apply_local_filters(markets: list[RewardsMarket], filters: ScanFilters) -> list[RewardsMarket]:

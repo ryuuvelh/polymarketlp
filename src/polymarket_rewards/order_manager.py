@@ -19,12 +19,14 @@ class OrderManager:
             order_id = str(order.get("id") or order.get("order_id") or "")
             if not order_id:
                 continue
+            tier = str(order.get("tier") or order.get("client_tag") or "")
             live = LiveOrder(
                 order_id=order_id,
                 token_id=str(order.get("asset_id") or order.get("token_id") or ""),
                 side=str(order.get("side") or ""),
                 price=float(order.get("price") or 0),
                 size=float(order.get("original_size") or order.get("size") or 0),
+                tier=tier,
             )
             self.tracked[order_id] = live
         return open_orders
@@ -44,18 +46,33 @@ class OrderManager:
     def _plan_key(self, plan: QuotePlan) -> str:
         return f"{plan.token.token_id}:{plan.side}:{plan.tier}:{plan.price:.4f}"
 
-    def replace_quotes(self, plans: list[QuotePlan], *, market_question: str = "") -> list[dict[str, object]]:
+    def replace_quotes(
+        self,
+        plans: list[QuotePlan],
+        *,
+        market_question: str = "",
+        cancel_first: bool = True,
+    ) -> list[dict[str, object]]:
+        if cancel_first:
+            self.sync_orders()
+
         desired = {self._plan_key(plan): plan for plan in plans}
         current_keys = {
-            f"{order.token_id}:{order.side}:{order.tier}:{order.price:.4f}": order
+            self._plan_key_from_order(order): order
             for order in self.tracked.values()
         }
 
         results: list[dict[str, object]] = []
-        for key, order in list(current_keys.items()):
-            if key not in desired:
-                results.append(self.trader.cancel_order(order.order_id))
-                self.tracked.pop(order.order_id, None)
+        if cancel_first:
+            for key, order in list(current_keys.items()):
+                if key not in desired:
+                    results.append(self.trader.cancel_order(order.order_id))
+                    self.tracked.pop(order.order_id, None)
+        else:
+            for key, order in list(current_keys.items()):
+                if key not in desired:
+                    results.append(self.trader.cancel_order(order.order_id))
+                    self.tracked.pop(order.order_id, None)
 
         for key, plan in desired.items():
             if key in current_keys:
@@ -73,3 +90,7 @@ class OrderManager:
                     tier=plan.tier,
                 )
         return results
+
+    @staticmethod
+    def _plan_key_from_order(order: LiveOrder) -> str:
+        return f"{order.token_id}:{order.side}:{order.tier}:{order.price:.4f}"

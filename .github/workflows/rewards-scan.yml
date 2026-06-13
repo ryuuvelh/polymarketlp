@@ -13,12 +13,13 @@ on:
   workflow_dispatch:
     inputs:
       sort:
-        description: "Sort by efficiency, reward, pool, or risk_adjusted"
+        description: "Sort by efficiency, reward, pool, risk_adjusted, or combined"
         required: false
         default: risk_adjusted
         type: choice
         options:
           - risk_adjusted
+          - combined
           - reward
           - efficiency
           - pool
@@ -53,8 +54,13 @@ jobs:
         env:
           SCAN_SORT: ${{ github.event.inputs.sort || 'risk_adjusted' }}
           SCAN_TOP: ${{ github.event.inputs.top || '15' }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
+          CURRENTS_API_KEY: ${{ secrets.CURRENTS_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: |
           python -m polymarket_rewards.cli scan \
+            --with-news \
             --sort "$SCAN_SORT" \
             --top "$SCAN_TOP" \
             --min-rate 5 \
