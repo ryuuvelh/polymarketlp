@@ -1,0 +1,8 @@
+#!/bin/sh
+# Strip Cursor agent attribution from commit messages.
+msg_file="$1"
+sed -i '' \
+  -e '/^Co-authored-by: Cursor <cursoragent@cursor.com>[[:space:]]*$/d' \
+  -e '/^Made-with: Cursor[[:space:]]*$/d' \
+  -e '/^Made with Cursor[[:space:]]*$/d' \
+  "$msg_file"

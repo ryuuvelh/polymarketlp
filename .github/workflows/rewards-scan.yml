@@ -13,11 +13,12 @@ on:
   workflow_dispatch:
     inputs:
       sort:
-        description: "Sort by efficiency, reward, or pool"
+        description: "Sort by efficiency, reward, pool, or risk_adjusted"
         required: false
-        default: reward
+        default: risk_adjusted
         type: choice
         options:
+          - risk_adjusted
           - reward
           - efficiency
           - pool
@@ -50,7 +51,7 @@ jobs:
 
       - name: Run scan
         env:
-          SCAN_SORT: ${{ github.event.inputs.sort || 'reward' }}
+          SCAN_SORT: ${{ github.event.inputs.sort || 'risk_adjusted' }}
           SCAN_TOP: ${{ github.event.inputs.top || '15' }}
         run: |
           python -m polymarket_rewards.cli scan \
@@ -58,6 +59,7 @@ jobs:
             --top "$SCAN_TOP" \
             --min-rate 5 \
             --max-competitiveness 10 \
+            --min-hours-to-expiry 3 \
             --format markdown \
             --output scan-results.md
 

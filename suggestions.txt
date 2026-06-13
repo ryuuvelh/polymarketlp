@@ -1,0 +1,64 @@
+To set up an LP bot that safely harvests liquidity rewards while avoiding a catastrophic, 100-to-0 wipeout on news-driven markets, you have to transition your logic from a simple "always-on" quoter to an **information-aware execution engine**.
+
+Professional automated market makers on Polymarket survive by assuming every aggressive order hitting their book is an insider or a faster bot. To protect your $100 capital and limit your downside to minor, manageable friction losses, your bot's script should implement the following structural guardrails:
+
+---
+
+## 1. Implement a Fast-Drop Latency Kill Switch
+
+The biggest threat to your bot is "latency arbitrage"—when news drops, a faster bot hits your stale limit order before you can pull it.
+
+* **The Logic:** Your script should continuously monitor Polymarket's global trading volume or sharp price deltas via a WebSocket connection to the CLOB (`wss://clob.polymarket.com/ws`).
+* **The Rule:** If the market price moves by more than **3¢ to 5¢ within a single 5-second window**, or if trading volume spikes by $300\%$ over its 5-minute moving average, **instantly cancel all active resting orders.**
+* **Why this works:** This panic button forces your bot to step aside during high-chaos news events. It is better to miss out on 30 minutes of liquidity rewards than to let someone fill your book with toxic flow.
+
+## 2. Use "Asymmetric Quoting" (Don't Split 50/50 Equidistant)
+
+Instead of placing your bids exactly the same distance from the midpoint (e.g., buying YES at 39¢ and NO at 59¢ when the midpoint is 40/60), adjust your spreads based on directional risk.
+
+* **The Logic:** If the macro sentiment or momentum is heavily pushing toward a "YES" outcome, your bot should widen its bid on the NO side (e.g., lowering the price it's willing to pay for NO to 55¢ instead of 59¢) while keeping its YES bid tight to harvest rewards.
+* **Why this works:** It forces the market to pay you a steep premium to fill your order if they are trying to dump a dying token onto your book.
+
+## 3. The Hard Expiration/Time-Censorship Barrier
+
+On a deadline contract like the one resolving today (June 13), risk escalates exponentially the closer you get to the clock striking midnight or the target announcement hour. Liquidity rewards do not scale up to compensate for this cliff-edge risk.
+
+* **The Logic:** Hardcode a temporal constraint into your loop:
+```python
+if current_time >= target_resolution_time - timedelta(hours=3):
+    cancel_all_orders()
+    stop_bot()
+
+```
+
+
+* **Why this works:** You completely eliminate the possibility of holding the bag when the oracle formally settles the contract to 100 or 0. You gracefully harvest yield during the quiet mid-day hours and leave the high-risk endgame to over-leveraged retail traders.
+
+## 4. Size Scaling & Order Sharding
+
+Never post your entire $100 allocation as a single block order sitting at the top of the book. If you do, an arbitrageur will sweep your entire bankroll in one transaction.
+
+* **The Logic:** Split your capital into tiers (shards). Post $15 right inside the blue zone to actively farm rewards. Place another $25 slightly deeper into the book (e.g., 2¢ further away from the midpoint). Keep the remaining $60 uncommitted in your wallet as free USDC.
+* **Why this works:** If a minor price blip occurs, only your small $15 tier gets filled (resulting in a small, intermittent loss or a cheap inventory intake). Your deep tiers protect you from sudden wick downs, and you preserve cash to rebalance without getting completely wiped out.
+
+---
+
+### The Operational Architecture Checklist
+
+If you are writing this in Python or Node.js, your main execution loop should look like this sequence on every tick:
+
+```
+[Start Loop]
+   │
+   ├──> Check Time: Is it within 3 hours of market expiration? ──> YES ──> [Cancel Orders & Sleep]
+   │
+   ├──> Check Live Volatility: Has price moved > 4% in 10s? ─────> YES ──> [Emergency Cancel Orders]
+   │
+   ├──> Check Wallet Balance: Do I hold too many YES or NO tokens?
+   │       └──> YES (Inventory Imbalance) ──> Adjust spread wider on that side to stop buying more.
+   │
+   └──> Smooth Sailing: Place/Maintain tiered limit orders inside the Blue Zone.
+
+```
+
+By prioritizing **speed-to-cancel** over speed-to-order-placement, your bot turns into a defensive yield harvester rather than a target for predatory flow.

@@ -168,4 +168,5 @@ class ClobClient:
             "market_competitiveness",
             gamma.get("marketCompetitiveness", reward_payload.get("market_competitiveness", 0)),
         )
+        reward_payload.setdefault("end_date", gamma.get("endDate") or gamma.get("end_date"))
         return RewardsMarket.from_api(reward_payload)

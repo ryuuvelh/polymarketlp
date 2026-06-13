@@ -10,7 +10,10 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
+from polymarket_rewards.engine import EngineConfig, RewardsEngine
+from polymarket_rewards.risk import RiskConfig
 from polymarket_rewards.scanner import RewardsScanner, ScanFilters
+from polymarket_rewards.scorer import TierConfig
 from polymarket_rewards.trader import RewardsTrader, TraderConfig
 
 
@@ -30,13 +33,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="Skip markets above this competitiveness score",
     )
+    scan.add_argument(
+        "--min-hours-to-expiry",
+        type=float,
+        default=3.0,
+        help="Exclude markets resolving within this many hours",
+    )
+    scan.add_argument(
+        "--include-near-expiry",
+        action="store_true",
+        help="Include markets close to expiry (soft penalty only)",
+    )
+    scan.add_argument(
+        "--max-capital",
+        type=float,
+        default=None,
+        help="Skip markets needing more capital than this budget (USD)",
+    )
     scan.add_argument("--query", type=str, default=None, help="Text search on market question")
     scan.add_argument("--tag", type=str, default=None, help="Filter by tag slug")
     scan.add_argument(
         "--sort",
-        choices=["efficiency", "reward", "pool"],
-        default="efficiency",
-        help="Sort by capital efficiency, estimated reward, or raw pool size",
+        choices=["efficiency", "reward", "pool", "risk_adjusted"],
+        default="risk_adjusted",
+        help="Sort by capital efficiency, estimated reward, raw pool, or risk-adjusted score",
     )
     scan.add_argument(
         "--format",
@@ -49,48 +69,83 @@ def build_parser() -> argparse.ArgumentParser:
     quote = subparsers.add_parser("quote", help="Place reward-qualifying quotes for one market")
     quote.add_argument("--market-id", required=True, help="Polymarket market_id from scan output")
     quote.add_argument("--live", action="store_true", help="Submit real orders (default is dry-run)")
+    quote.add_argument(
+        "--tiered",
+        action="store_true",
+        help="Use tiered capital deployment from TOTAL_CAPITAL_USD in .env",
+    )
+
+    run = subparsers.add_parser("run", help="Run the defensive LP engine loop")
+    run.add_argument("--market-id", type=str, default=None, help="Market to quote continuously")
+    run.add_argument(
+        "--auto-pick-top",
+        type=int,
+        default=0,
+        help="Pick Nth best risk-adjusted market when --market-id is omitted",
+    )
+    run.add_argument("--live", action="store_true", help="Submit real orders (default is dry-run)")
+    run.add_argument("--tick-seconds", type=float, default=3.0, help="Seconds between engine ticks")
 
     return parser
+
+
+def _format_expiry(hours: float | None) -> str:
+    if hours is None:
+        return "unknown"
+    if hours < 0:
+        return "expired"
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
 
 
 def render_scan_results(results, top: int, console: Console, sort: str) -> None:
     table = Table(title=f"Top Polymarket Liquidity Reward Opportunities (sorted by {sort})")
     table.add_column("#", justify="right")
-    table.add_column("Market", max_width=48)
+    table.add_column("Market", max_width=40)
     table.add_column("$/day", justify="right")
     table.add_column("Comp", justify="right")
     table.add_column("Est $/day", justify="right")
     table.add_column("Capital", justify="right")
-    table.add_column("$ / $100", justify="right")
-    table.add_column("Notes", max_width=28)
+    table.add_column("Risk", justify="right")
+    table.add_column("Expires", justify="right")
+    table.add_column("Notes", max_width=24)
 
     for index, item in enumerate(results[:top], start=1):
         market = item.market
+        flags = ",".join(item.risk_flags[:2]) if item.risk_flags else "-"
         table.add_row(
             str(index),
-            market.question[:48],
+            market.question[:40],
             f"{market.rate_per_day:,.0f}",
             f"{market.market_competitiveness:.2f}",
             f"{item.estimated_daily_reward:.2f}",
             f"${item.capital_required_usd:,.0f}",
-            f"{item.reward_per_100_usd:.2f}",
-            "; ".join(item.notes),
+            f"{item.risk_score:.0f}",
+            _format_expiry(item.hours_to_expiry),
+            flags,
         )
 
     console.print(table)
     console.print()
-    console.print("Use [bold]market_id[/bold] from scan details with [bold]quote --market-id[/bold].")
+    console.print("Use [bold]market_id[/bold] from scan details with [bold]quote --market-id[/bold] or [bold]run --market-id[/bold].")
 
 
 def render_scan_details(results, top: int, console: Console) -> None:
     detail = Table(title="Market IDs and Links")
     detail.add_column("market_id")
+    detail.add_column("risk_adj")
     detail.add_column("slug")
     detail.add_column("url")
 
     for item in results[:top]:
         market = item.market
-        detail.add_row(market.market_id, market.market_slug, market.polymarket_url)
+        detail.add_row(
+            market.market_id,
+            f"{item.risk_adjusted_score:.2f}",
+            market.market_slug,
+            market.polymarket_url,
+        )
 
     console.print(detail)
 
@@ -109,6 +164,10 @@ def score_to_dict(item) -> dict:
         "reward_per_100_usd": item.reward_per_100_usd,
         "requires_two_sided": item.requires_two_sided,
         "midpoint": item.midpoint,
+        "risk_score": item.risk_score,
+        "risk_flags": list(item.risk_flags),
+        "risk_adjusted_score": item.risk_adjusted_score,
+        "hours_to_expiry": item.hours_to_expiry,
         "notes": list(item.notes),
     }
 
@@ -119,16 +178,18 @@ def render_scan_markdown(results, top: int, sort: str) -> str:
         "",
         f"Sorted by **{sort}** · showing top {min(top, len(results))} markets",
         "",
-        "| # | Market | $/day | Comp | Est $/day | Capital | $/100 | market_id |",
-        "|---:|---|---:|---:|---:|---:|---:|---|",
+        "| # | Market | $/day | Comp | Est $/day | Capital | Risk | Expires | Flags | market_id |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for index, item in enumerate(results[:top], start=1):
         market = item.market
-        question = market.question.replace("|", "/")[:60]
+        question = market.question.replace("|", "/")[:50]
+        flags = ",".join(item.risk_flags[:3]) if item.risk_flags else "-"
         lines.append(
             f"| {index} | {question} | {market.rate_per_day:,.0f} | "
             f"{market.market_competitiveness:.2f} | {item.estimated_daily_reward:.2f} | "
-            f"${item.capital_required_usd:,.0f} | {item.reward_per_100_usd:.2f} | {market.market_id} |"
+            f"${item.capital_required_usd:,.0f} | {item.risk_score:.0f} | "
+            f"{_format_expiry(item.hours_to_expiry)} | {flags} | {market.market_id} |"
         )
 
     lines.extend(["", "## Links", ""])
@@ -161,10 +222,18 @@ def write_scan_output(results, args: argparse.Namespace) -> None:
 def cmd_scan(args: argparse.Namespace) -> int:
     console = Console() if args.format == "table" else None
     scanner = RewardsScanner()
+    tier_config = TierConfig.from_env()
+    max_capital = args.max_capital
+    if max_capital is None and tier_config is not None:
+        max_capital = tier_config.deployable_usd
+
     filters = ScanFilters(
         min_rate_per_day=args.min_rate,
         min_volume_24hr=args.min_volume,
         max_competitiveness=args.max_competitiveness,
+        min_hours_to_expiry=args.min_hours_to_expiry,
+        exclude_near_expiry=not args.include_near_expiry,
+        max_capital_usd=max_capital,
         query=args.query,
         tag_slug=args.tag,
     )
@@ -176,6 +245,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
         results.sort(key=lambda item: item.estimated_daily_reward, reverse=True)
     elif args.sort == "pool":
         results.sort(key=lambda item: item.market.rate_per_day, reverse=True)
+    elif args.sort == "efficiency":
+        results.sort(key=lambda item: item.opportunity_score, reverse=True)
+    else:
+        results.sort(key=lambda item: item.risk_adjusted_score, reverse=True)
+
     if not results:
         message = "No markets matched your filters. Try lowering --min-rate or --max-competitiveness."
         if args.format == "table":
@@ -196,7 +270,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
 def cmd_quote(args: argparse.Namespace) -> int:
     console = Console()
     scanner = RewardsScanner()
-    match = scanner.get_market_score(args.market_id)
+    tier_config = TierConfig.from_env() if args.tiered else None
+    if args.tiered and tier_config is None:
+        console.print("[red]--tiered requires TOTAL_CAPITAL_USD in .env[/red]")
+        return 1
+
+    match = scanner.get_market_score(args.market_id, tier_config=tier_config)
     if match is None:
         console.print(f"[red]Market {args.market_id} not found among active reward markets.[/red]")
         return 1
@@ -212,8 +291,9 @@ def cmd_quote(args: argparse.Namespace) -> int:
     )
     trader = RewardsTrader(config=config)
 
-    orders = trader.quote_market(match)
+    orders = trader.quote_market(match, tier_config=tier_config, tiered=args.tiered)
     table = Table(title=f"Quote plan: {match.market.question}")
+    table.add_column("Tier")
     table.add_column("Outcome")
     table.add_column("Side")
     table.add_column("Price", justify="right")
@@ -222,6 +302,7 @@ def cmd_quote(args: argparse.Namespace) -> int:
 
     for order in orders:
         table.add_row(
+            str(order.get("tier", "")),
             str(order["outcome"]),
             str(order["side"]),
             f"{order['price']:.3f}",
@@ -230,9 +311,38 @@ def cmd_quote(args: argparse.Namespace) -> int:
         )
 
     console.print(table)
+    console.print(f"Risk score: {match.risk_score:.0f} · flags: {', '.join(match.risk_flags) or 'none'}")
     if not args.live:
         console.print("[cyan]Dry run only. Re-run with --live to submit orders.[/cyan]")
     return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    if not args.market_id and args.auto_pick_top <= 0:
+        print("Provide --market-id or --auto-pick-top N", file=sys.stderr)
+        return 1
+
+    risk_config = RiskConfig.from_env(require_capital=True)
+    trader_config = TraderConfig(
+        private_key=os.getenv("PRIVATE_KEY", ""),
+        funder_address=os.getenv("FUNDER_ADDRESS") or None,
+        signature_type=int(os.getenv("SIGNATURE_TYPE", "2")),
+        dry_run=not args.live,
+    )
+    engine = RewardsEngine(
+        engine_config=EngineConfig(
+            market_id=args.market_id,
+            auto_pick_top=args.auto_pick_top,
+            tick_seconds=args.tick_seconds,
+            dry_run=not args.live,
+        ),
+        risk_config=risk_config,
+        trader=RewardsTrader(config=trader_config),
+    )
+    return engine.run()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -243,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_scan(args)
     if args.command == "quote":
         return cmd_quote(args)
+    if args.command == "run":
+        return cmd_run(args)
     return 1
 
 

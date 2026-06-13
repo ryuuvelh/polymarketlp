@@ -12,10 +12,15 @@ dependencies = [
   "requests>=2.31.0",
   "rich>=13.7.0",
   "python-dotenv>=1.0.0",
+  "websocket-client>=1.7.0",
 ]
 
 [project.optional-dependencies]
 trading = ["py-clob-client-v2>=0.1.0"]
+dev = ["pytest>=8.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [project.scripts]
 polymarket-rewards = "polymarket_rewards.cli:main"

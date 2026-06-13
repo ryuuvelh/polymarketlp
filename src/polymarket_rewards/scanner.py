@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .client import ClobClient, RewardsMarket
-from .scorer import MarketScore, rank_markets, score_market
+from .scorer import MarketScore, TierConfig, rank_markets, score_market
 
 
 @dataclass(frozen=True)
@@ -12,6 +12,9 @@ class ScanFilters:
     min_volume_24hr: float = 0.0
     max_competitiveness: float | None = None
     min_reward_per_100_usd: float = 0.0
+    min_hours_to_expiry: float | None = None
+    exclude_near_expiry: bool = True
+    max_capital_usd: float | None = None
     query: str | None = None
     tag_slug: str | None = None
 
@@ -20,14 +23,18 @@ class RewardsScanner:
     def __init__(self, client: ClobClient | None = None) -> None:
         self.client = client or ClobClient()
 
-    def get_market_score(self, market_id: str) -> MarketScore | None:
+    def get_market_score(self, market_id: str, *, tier_config: TierConfig | None = None) -> MarketScore | None:
         market = self.client.fetch_market_by_id(market_id)
         if market is None:
             return None
-        return score_market(market)
+        return score_market(market, tier_config=tier_config)
 
     def scan(self, filters: ScanFilters | None = None) -> list[MarketScore]:
         filters = filters or ScanFilters()
+        tier_config = TierConfig.from_env() if filters.max_capital_usd is None else None
+        if filters.max_capital_usd is not None and tier_config is None:
+            tier_config = TierConfig(total_capital_usd=filters.max_capital_usd)
+
         params: dict[str, object] = {}
         if filters.query:
             params["q"] = filters.query
@@ -38,7 +45,7 @@ class RewardsScanner:
 
         markets = self.client.fetch_all_reward_markets(params=params or None)
         markets = self._apply_local_filters(markets, filters)
-        ranked = rank_markets(markets)
+        ranked = rank_markets(markets, tier_config=tier_config)
         return self._apply_score_filters(ranked, filters)
 
     @staticmethod
@@ -54,6 +61,14 @@ class RewardsScanner:
 
     @staticmethod
     def _apply_score_filters(scored: list[MarketScore], filters: ScanFilters) -> list[MarketScore]:
-        if filters.min_reward_per_100_usd <= 0:
-            return scored
-        return [item for item in scored if item.reward_per_100_usd >= filters.min_reward_per_100_usd]
+        result: list[MarketScore] = []
+        for item in scored:
+            if filters.min_reward_per_100_usd > 0 and item.reward_per_100_usd < filters.min_reward_per_100_usd:
+                continue
+            if filters.exclude_near_expiry and filters.min_hours_to_expiry is not None:
+                if item.hours_to_expiry is not None and item.hours_to_expiry < filters.min_hours_to_expiry:
+                    continue
+            if filters.max_capital_usd is not None and item.capital_required_usd > filters.max_capital_usd:
+                continue
+            result.append(item)
+        return result
