@@ -1,0 +1,72 @@
+name: Polymarket Rewards Scan
+
+on:
+  schedule:
+    # Every hour at minute 0 (UTC)
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      sort:
+        description: "Sort by efficiency, reward, or pool"
+        required: false
+        default: reward
+        type: choice
+        options:
+          - reward
+          - efficiency
+          - pool
+      top:
+        description: "Number of markets to include"
+        required: false
+        default: "15"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e .
+
+      - name: Run scan
+        env:
+          SCAN_SORT: ${{ github.event.inputs.sort || 'reward' }}
+          SCAN_TOP: ${{ github.event.inputs.top || '15' }}
+        run: |
+          python -m polymarket_rewards.cli scan \
+            --sort "$SCAN_SORT" \
+            --top "$SCAN_TOP" \
+            --min-rate 5 \
+            --max-competitiveness 10 \
+            --format markdown \
+            --output scan-results.md
+
+      - name: Publish job summary
+        run: cat scan-results.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: polymarket-rewards-scan
+          path: scan-results.md
+          retention-days: 7
+
+      - name: Notify Discord
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python -m polymarket_rewards.notify scan-results.md

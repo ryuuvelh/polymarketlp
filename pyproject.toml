@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-rewards-bot"
+version = "0.1.0"
+description = "Scanner and quoter for Polymarket liquidity rewards"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "requests>=2.31.0",
+  "rich>=13.7.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+trading = ["py-clob-client-v2>=0.1.0"]
+
+[project.scripts]
+polymarket-rewards = "polymarket_rewards.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
